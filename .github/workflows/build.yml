@@ -1,4 +1,4 @@
-name: Florida Frida 17.16.4 - Carry-fixed Android Build
+name: Florida Frida 17.16.4 - Source Port Audit Build
 
 on:
   workflow_dispatch:
@@ -87,6 +87,12 @@ jobs:
           # The florida-zygisk project maintains fixes for Florida patches
           # incompatible with newer Frida versions. This is THIRD-PARTY code.
           git clone --depth 1 https://github.com/thelok1s/florida-zygisk.git florida-helpers
+          # Commit used by the previously successful Actions run (reproducible build).
+          carry_rev=d16a4108d6311771662278d107435270a2c97d7e
+          if ! git -C florida-helpers cat-file -e "${carry_rev}^{commit}" 2>/dev/null; then
+            git -C florida-helpers fetch --depth 1 origin "$carry_rev"
+          fi
+          git -C florida-helpers checkout --detach "$carry_rev"
           test -f florida-helpers/scripts/florida_carry.py
           test -f florida-helpers/scripts/anti-anti-frida.py
           echo "Carry helpers commit: $(git -C florida-helpers rev-parse HEAD)"
@@ -147,6 +153,113 @@ jobs:
           git -C subprojects/frida-core diff --check
           echo 'CARRY_FIXES_COMPLETE'
 
+      - name: Strictly audit all 11 Florida patch effects (fail closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_AUDIT'
+          from pathlib import Path
+          root = Path('frida/subprojects/frida-core')
+          core = root / 'src'
+          patches = Path('florida-patches/patches/frida-core')
+          script = core / 'anti-anti-frida.py'
+          helper = Path('florida-helpers/scripts/anti-anti-frida.py')
+          skipped = set(Path('skipped-patches.txt').read_text().splitlines())
+          expected = {
+              'frida-core/0001-Florida-string_frida_rpc.patch',
+              'frida-core/0003-Florida-symbol_frida_agent_main.patch',
+              'frida-core/0004-Florida-thread_gum_js_loop.patch',
+              'frida-core/0005-Florida-thread_gmain.patch',
+              'frida-core/0007-Florida-update-python-script.patch',
+          }
+
+          def require(condition, detail):
+              if not condition:
+                  raise SystemExit('::error::SOURCE PATCH AUDIT FAILED: ' + detail)
+
+          # Reject ANY unreviewed skipped patches instead of building a partial Florida server.
+          require(not (skipped - expected), 'unexpected skipped patches: ' + str(sorted(skipped - expected)))
+          require(len(list(Path('florida-patches/patches').glob('*/*.patch'))) == 11,
+                  'expected exactly 11 Florida patch files for this source tag')
+          for rel in expected:
+              require((Path('florida-patches/patches') / rel).exists(), 'missing original patch: ' + rel)
+
+          # 0001: RPC definition + call-site replacements.
+          rpc = (root / 'lib/base/rpc.vala').read_text()
+          require('public string getRpcStr' in rpc, '0001 RPC helper absent')
+          require('Wm5KcFpHRTZjbkJq' in rpc, '0001 RPC encoding absent')
+          require('getRpcStr(false)' in rpc and 'getRpcStr(true)' in rpc,
+                  '0001 RPC call-sites not both migrated')
+          require('.add_string_value ("frida:rpc")' not in rpc,
+                  '0001 original RPC wire string still used at call-site')
+
+          # 0003: target-specific entrypoints and original test-call sites.
+          for rel in (
+              'agent-container.vala',
+              'linux/linux-host-session.vala',
+              'darwin/darwin-host-session.vala',
+              'freebsd/freebsd-host-session.vala',
+              'qnx/qnx-host-session.vala',
+              'windows/windows-host-session.vala',
+          ):
+              f = core / rel
+              require(f.exists(), '0003 missing expected source: ' + str(f))
+              txt = f.read_text()
+              require('"frida_agent_main"' not in txt,
+                      '0003 old literal entrypoint in ' + rel)
+              require('"main"' in txt, '0003 new literal entrypoint not found in ' + rel)
+
+          # The carry helper handles runtime source but not Florida's test-only hunks:
+          # forward-port those test call sites for full source-equivalent coverage.
+          for rel in ('test-agent.vala', 'test-injector.vala'):
+              f = root / 'tests' / rel
+              require(f.exists(), '0003 missing expected test source: ' + str(f))
+              previous = f.read_text()
+              updated = previous.replace('"frida_agent_main"', '"main"')
+              if updated != previous:
+                  f.write_text(updated)
+                  print('PORT_TEST_CALL_SITE=' + str(f))
+              require('"frida_agent_main"' not in f.read_text(),
+                      '0003 original test entrypoint remains: ' + rel)
+
+          # 0003+0004+0005+0007: the helper provides the final cumulative script.
+          require(script.is_file(), '0003 final anti-anti-frida.py absent')
+          require(script.read_bytes() == helper.read_bytes(),
+                  '0003/0004/0005/0007 final agent script differs from pinned carry version')
+          s = script.read_text()
+          for marker, patch in (
+              ('symbol.name == "frida_agent_main"', '0003 symbol rename'),
+              ('symbol.name = "main"', '0003 symbol rename'),
+              ('gum-js-loop', '0004 thread_gum_js_loop'),
+              ('gmain', '0005 thread_gmain'),
+              ('gdbus', '0007 updated script'),
+              ('FridaScriptEngine', '0007 string revisions'),
+              ('GLib-GIO', '0007 string revisions'),
+              ('GDBusProxy', '0007 string revisions'),
+              ('GumScript', '0007 string revisions'),
+          ):
+              require(marker in s, patch + ' marker absent')
+          embed = (core / 'embed-agent.py').read_text()
+          require('FLORIDA_ANTI_ANTI_FRIDA' in embed and 'anti-anti-frida' in embed,
+                  '0003-0007 processing is not hooked into agent embedding')
+
+          # Account for all 11 Florida patches without mislabeling their Git histories.
+          lines = [
+              'FRIDA_VERSION=17.16.4',
+              'EXPECTED_FLORIDA_PATCHES=11',
+              'APPLIED_ORIGINAL_GIT_PATCHES=' + str(11 - len(skipped)),
+              'PORTED_EQUIVALENT_SOURCE_PATCHES=' + str(len(skipped)),
+              'SOURCE_AUDIT=PASS',
+              'NOTE=This verifies source-level equivalents; agent binaries and runtime still require verification.',
+          ]
+          lines += ['PORT_SOURCE ' + k for k in sorted(skipped)]
+          Path('effective-patch-report.txt').write_text('\n'.join(lines) + '\n')
+          print('\n'.join(lines))
+          print('FLORIDA_SOURCE_PATCH_COVERAGE=11/11')
+          PY_AUDIT
+          # Prove source modifications have no whitespace errors.
+          git -C frida/subprojects/frida-core diff --check
+
       - name: Build frida-server
         shell: bash
         env:
@@ -162,6 +275,34 @@ jobs:
           make -j2 subprojects/frida-core/server/frida-server
           test -s subprojects/frida-core/server/frida-server
           echo 'FRIDA_SERVER_BUILD_SUCCESS'
+
+      - name: Verify both embedded agent ELF files contain carried changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY_AGENT'
+          from pathlib import Path
+          import os
+          build = Path('build-' + os.environ['TARGET_ARCH'])
+          agentdir = build / 'subprojects/frida-core/src/frida-data-agent-blob.S.p'
+          # The previous arm64 Actions log confirms these are the two real ELF agents.
+          agents = [agentdir / 'frida-agent-64.so', agentdir / 'frida-agent-32.so']
+          for path in agents:
+              if not path.is_file():
+                  raise SystemExit('::error::AGENT AUDIT FAILED: not found: ' + str(path))
+              data = path.read_bytes()
+              if not data.startswith(b'\x7fELF'):
+                  raise SystemExit('::error::AGENT AUDIT FAILED: not ELF: ' + str(path))
+              # The cumulative 0003/0004/0005/0007 patcher must replace these exact signatures.
+              for signature in (b'frida_agent_main', b'gum-js-loop', b'gmain', b'gdbus'):
+                  if signature in data:
+                      raise SystemExit('::error::AGENT AUDIT FAILED: ' + repr(signature)
+                                       + ' still present in ' + str(path))
+              print('AGENT_PATCH_CHECK_OK: ' + str(path) + ' (' + str(len(data)) + ' bytes)')
+          report = Path('effective-patch-report.txt')
+          report.write_text(report.read_text() + 'AGENT_STATIC_AUDIT=PASS\n')
+          print('FLORIDA_AGENT_PATCH_AUDIT_OK')
+          PY_AGENT
 
       - name: Validate binary and package files
         shell: bash
@@ -182,14 +323,15 @@ jobs:
           out="dist/florida-server-$FRIDA_VERSION-$TARGET_ARCH"
           cp "$src" "$out"
           gzip -9 -c "$out" > "$out.gz"
-          cp patch-summary.txt skipped-patches.txt dist/
+          cp patch-summary.txt skipped-patches.txt effective-patch-report.txt dist/
           {
             echo "Frida version: $FRIDA_VERSION"
             echo "Florida revision: $(git -C florida-patches rev-parse HEAD)"
             echo "Frida revision: $(git -C frida rev-parse HEAD)"
             echo "Carry revision: $(git -C florida-helpers rev-parse HEAD)"
             echo "Binary checks: BINARY_CHECKS_OK"
-            echo "Note: skipped original patches may not be fully reproduced by carry fixes."
+            echo "Patch status: see effective-patch-report.txt (direct original vs ported equivalents)."
+            echo "Note: static checks do not prove successful runtime injection or every anti-detection behavior."
           } > dist/BUILD_PROVENANCE.txt
           ( cd dist && sha256sum "$(basename "$out")" "$(basename "$out").gz" > SHA256SUMS.txt )
           file "$out"
@@ -203,4 +345,3 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 30
-
