@@ -1,4 +1,4 @@
-name: Florida Frida 17.16.4 - Verified 11 Patch Build
+name: Florida Frida 17.16.4 - 11 Florida Patches and 2 Extra Fixes
 
 on:
   workflow_dispatch:
@@ -279,6 +279,139 @@ jobs:
           git -C subprojects/frida-gum diff --check
           echo 'CARRY_FIXES_COMPLETE'
 
+      - name: Apply extra server directory and agent SONAME fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > frida/subprojects/frida-core/src/rewrite-agent-soname.py <<'PY_SONAME'
+          # Additional local change; not one of the eleven upstream Florida patches.
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import secrets
+          import stat
+          import sys
+          import tempfile
+          from elftools.elf.elffile import ELFFile
+
+          OLD_SONAME = 'libfrida-agent-raw.so'
+
+          def inspect(data):
+              elf = ELFFile(io.BytesIO(data))
+              dynamic = next((s for s in elf.iter_segments()
+                              if s.header['p_type'] == 'PT_DYNAMIC'), None)
+              if dynamic is None:
+                  raise RuntimeError('Missing PT_DYNAMIC')
+              names = [t for t in dynamic.iter_tags() if t.entry['d_tag'] == 'DT_SONAME']
+              if len(names) != 1:
+                  raise RuntimeError('Expected exactly one DT_SONAME')
+              needed = [t.needed for t in dynamic.iter_tags() if t.entry['d_tag'] == 'DT_NEEDED']
+              symbols = [(s.name, s.entry) for s in dynamic.iter_symbols()]
+              return elf, dynamic, names[0], needed, symbols
+
+          def main(path):
+              original = path.read_bytes()
+              elf, dynamic, tag, needed, symbols = inspect(original)
+              if tag.soname != OLD_SONAME:
+                  raise RuntimeError('Unexpected input SONAME: ' + tag.soname)
+              # Keep every ELF offset, string offset, and hash input unchanged.
+              # The SONAME is metadata, not an exported symbol name.
+              new_name = 'lib' + secrets.token_hex(8)[:15] + '.so'
+              before = OLD_SONAME.encode() + b'\0'
+              after = new_name.encode() + b'\0'
+              if len(before) != len(after):
+                  raise RuntimeError('SONAME replacement must have the same length')
+              _, strings_offset = dynamic.get_table_offset('DT_STRTAB')
+              if strings_offset is None:
+                  raise RuntimeError('Unmapped DT_STRTAB')
+              soname_offset = strings_offset + tag.entry['d_val']
+              if original[soname_offset:soname_offset + len(before)] != before:
+                  raise RuntimeError('DT_SONAME string offset mismatch')
+              updated = bytearray(original)
+              replacements = 0
+              for section in elf.iter_sections():
+                  if section.header['sh_type'] != 'SHT_STRTAB':
+                      continue
+                  start = section.header['sh_offset']
+                  size = section.header['sh_size']
+                  payload = original[start:start + size]
+                  index = 0
+                  while True:
+                      index = payload.find(before, index)
+                      if index == -1:
+                          break
+                      if index and payload[index - 1] != 0:
+                          raise RuntimeError('SONAME overlaps another string')
+                      updated[start + index:start + index + len(before)] = after
+                      replacements += 1
+                      index += len(before)
+              result = bytes(updated)
+              if len(result) != len(original) or OLD_SONAME.encode() in result:
+                  raise RuntimeError('Old SONAME remains outside supported string tables')
+              _, _, checked, next_needed, next_symbols = inspect(result)
+              if checked.soname != new_name or needed != next_needed or symbols != next_symbols:
+                  raise RuntimeError('SONAME rewrite changed the symbol or dependency interface')
+              temporary = None
+              try:
+                  with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.', delete=False) as stream:
+                      temporary = Path(stream.name)
+                      stream.write(result)
+                  temporary.chmod(stat.S_IMODE(path.stat().st_mode))
+                  os.replace(temporary, path)
+                  temporary = None
+              finally:
+                  if temporary is not None:
+                      temporary.unlink(missing_ok=True)
+              report = {'old_soname': OLD_SONAME, 'soname': new_name,
+                        'string_table_replacements': replacements,
+                        'elf_layout_preserved': True, 'symbols_preserved': True,
+                        'needed_libraries_preserved': True}
+              Path(str(path) + '.soname.json').write_text(json.dumps(report, indent=2) + '\n')
+              print(f'AGENT_SONAME_REWRITE_OK: {path} -> {new_name}; copies={replacements}')
+
+          if __name__ == '__main__':
+              main(Path(sys.argv[1]))
+          PY_SONAME
+          python3 - <<'PY_EXTRA'
+          from pathlib import Path
+          import hashlib
+          import json
+          import secrets
+          root = Path('frida/subprojects/frida-core')
+          server = root / 'server/server.vala'
+          previous = server.read_text()
+          anchor = 'private const string DEFAULT_DIRECTORY = "re.frida.server";'
+          if previous.count(anchor) != 1:
+              raise SystemExit('::error::Unexpected server default directory definition')
+          directory = 'rt-' + secrets.token_hex(6)
+          replacement = f'private const string DEFAULT_DIRECTORY = "{directory}";'
+          server.write_text(previous.replace(anchor, replacement, 1))
+          embed = root / 'src/embed-agent.py'
+          source = embed.read_text()
+          marker = '                subprocess.run([sys.executable, str(patcher), str(embedded_agent)], check=True)\n'
+          if source.count(marker) != 1:
+              raise SystemExit('::error::Expected exactly one checked agent patch hook')
+          addition = ('                soname_patcher = Path(__file__).with_name("rewrite-agent-soname.py").resolve()\n'
+                      '                subprocess.run([sys.executable, str(soname_patcher), str(embedded_agent)], check=True)\n')
+          updated = source.replace(marker, marker + addition, 1)
+          compile(updated, str(embed), 'exec')
+          embed.write_text(updated)
+          patcher = root / 'src/rewrite-agent-soname.py'
+          compile(patcher.read_text(), str(patcher), 'exec')
+          report = {'extra_changes': ['server-runtime-directory', 'agent-soname'],
+                    'old_server_directory': 're.frida.server', 'server_directory': directory,
+                    'old_agent_soname': 'libfrida-agent-raw.so',
+                    'soname_patcher_sha256': hashlib.sha256(patcher.read_bytes()).hexdigest()}
+          Path('extra-patches.json').write_text(json.dumps(report, indent=2) + '\n')
+          print('SERVER_RUNTIME_DIRECTORY=' + directory)
+          print('EXTRA_CHANGES_APPLIED=2')
+          PY_EXTRA
+          git -C frida/subprojects/frida-core add server/server.vala src/rewrite-agent-soname.py src/embed-agent.py
+          git -C frida/subprojects/frida-core diff --cached --check
+          git -C frida/subprojects/frida-core commit -m 'Local: replace server directory and agent SONAME signatures'
+          printf 'EXTRA_CHANGES_APPLIED=2\n' >> patch-summary.txt
+
       - name: Strictly audit all 11 Florida patch effects (fail closed)
         shell: bash
         run: |
@@ -407,6 +540,27 @@ jobs:
 
           # Save original patch hashes and final source deltas for later review.
           import hashlib
+          import json
+          import re
+          extra = json.loads(Path('extra-patches.json').read_text())
+          require(extra['extra_changes'] == ['server-runtime-directory', 'agent-soname'],
+                  'unexpected extra change set')
+          require(re.fullmatch(r'rt-[0-9a-f]{12}', extra['server_directory']) is not None,
+                  'invalid server runtime directory')
+          server = (root / 'server/server.vala').read_text()
+          require(server.count('private const string DEFAULT_DIRECTORY = "' + extra['server_directory'] + '";') == 1,
+                  'extra server default directory definition absent')
+          require('re.frida.server' not in server,
+                  'extra old server directory remains in server source')
+          require('TemporaryDirectory.always_use ((directory != null) ? directory : DEFAULT_DIRECTORY);' in server,
+                  'extra server directory is not used by TemporaryDirectory')
+          soname_patcher = core / 'rewrite-agent-soname.py'
+          require(soname_patcher.is_file(), 'extra SONAME patcher absent')
+          require(hashlib.sha256(soname_patcher.read_bytes()).hexdigest() == extra['soname_patcher_sha256'],
+                  'extra SONAME patcher differs from the installed version')
+          require('subprocess.run([sys.executable, str(soname_patcher), str(embedded_agent)], check=True)' in embed,
+                  'extra SONAME patcher is not called before embedding')
+          compile(soname_patcher.read_text(), str(soname_patcher), 'exec')
           manifest = []
           for label in sorted(expected_all):
               digest = hashlib.sha256((Path('florida-patches/patches') / label).read_bytes()).hexdigest()
@@ -428,6 +582,8 @@ jobs:
               'APPLIED_ORIGINAL_GIT_PATCHES=9',
               'PORTED_FOR_17_16_4=2',
               'SKIPPED_PATCHES=0',
+              'EXTRA_CHANGES_APPLIED=2',
+              'SERVER_RUNTIME_DIRECTORY=' + extra['server_directory'],
               'SOURCE_AUDIT=PASS',
               'NOTE=This verifies source-level equivalents; agent binaries and runtime still require verification.',
           ]
@@ -465,6 +621,7 @@ jobs:
           import io
           import json
           import os
+          import re
           from elftools.elf.elffile import ELFFile
           from elftools.elf.hash import GNUHashTable, ELFHashTable
           build = Path('build-' + os.environ['TARGET_ARCH'])
@@ -538,12 +695,26 @@ jobs:
               for signature in (b'FridaScriptEngine', b'GLib-GIO', b'GDBusProxy', b'GumScript'):
                   if signature in rodata.data():
                       raise SystemExit('::error::Unpatched .rodata signature: ' + repr(signature))
+              sonames = [t.soname for t in dynamic.iter_tags() if t.entry['d_tag'] == 'DT_SONAME']
+              if len(sonames) != 1 or re.fullmatch(r'lib[0-9a-f]{15}\.so', sonames[0]) is None:
+                  raise SystemExit('::error::Agent SONAME was not rewritten: ' + str(path))
+              if b'libfrida-agent-raw.so' in data:
+                  raise SystemExit('::error::Old agent SONAME string remains: ' + str(path))
+              soname_report = json.loads(Path(str(path) + '.soname.json').read_text())
+              if (soname_report['soname'] != sonames[0] or
+                      soname_report['old_soname'] != 'libfrida-agent-raw.so' or
+                      soname_report['string_table_replacements'] < 1 or
+                      not soname_report['symbols_preserved'] or
+                      not soname_report['needed_libraries_preserved'] or
+                      not soname_report['elf_layout_preserved']):
+                  raise SystemExit('::error::Agent SONAME report mismatch: ' + str(path))
               records.append({'file': str(path), 'flavor': flavor, 'bytes': len(data),
                               'sha256': hashlib.sha256(data).hexdigest(),
                               'elf_class': elf.elfclass, 'machine': elf.header['e_machine'],
                               'defined_dynamic_main': True, 'hash_lookup_main': True,
                               'active_hash_tables': active_hashes,
                               'inactive_hash_sections': inactive_sections,
+                              'soname_rewrite': soname_report,
                               'signature_audit': 'PASS'})
               print('ELF_LOADER_HASH_OK: ' + str(path) + ' active=' +
                     ','.join(h['tag'] for h in active_hashes) + ' inactive-sections=' +
@@ -574,6 +745,27 @@ jobs:
             echo '::error::RPC carry marker not found in binary; cannot validate intended RPC change'
             exit 1
           fi
+          python3 - <<'PY_SERVER'
+          from pathlib import Path
+          import hashlib
+          import json
+          import os
+          extra = json.loads(Path('extra-patches.json').read_text())
+          server = Path('build-' + os.environ['TARGET_ARCH']) / 'subprojects/frida-core/server/frida-server'
+          data = server.read_bytes()
+          signatures = (b're.frida.server', b'libfrida-agent-raw.so')
+          for signature in signatures:
+              if signature in data:
+                  raise SystemExit('::error::Server hardening signature remains: ' + repr(signature))
+          if extra['server_directory'].encode() not in data:
+              raise SystemExit('::error::New server runtime directory not found in binary')
+          report = {'server_sha256': hashlib.sha256(data).hexdigest(),
+                    'server_directory': extra['server_directory'], 'extra_changes_applied': 2,
+                    'old_signature_counts': {s.decode(): data.count(s) for s in signatures},
+                    'static_audit': 'PASS', 'device_runtime_test': 'NOT_RUN'}
+          Path('server-hardening-audit.json').write_text(json.dumps(report, indent=2) + '\n')
+          print('SERVER_DIRECTORY_AND_SONAME_AUDIT=PASS')
+          PY_SERVER
           echo 'BINARY_CHECKS_OK'
           mkdir -p dist
           out="dist/florida-server-$FRIDA_VERSION-$TARGET_ARCH"
@@ -581,6 +773,7 @@ jobs:
           gzip -9 -c "$out" > "$out.gz"
           cp patch-summary.txt skipped-patches.txt ported-patches.txt applied-patches.txt effective-patch-report.txt dist/
           cp agent-audit.json PATCH_INPUT_SHA256SUMS.txt frida-core-effective.patch frida-gum-effective.patch dist/
+          cp extra-patches.json server-hardening-audit.json dist/
           {
             echo "Frida version: $FRIDA_VERSION"
             echo "Florida revision: $(git -C florida-patches rev-parse HEAD)"
@@ -593,6 +786,7 @@ jobs:
             python --version
             node --version
             echo "Binary checks: BINARY_CHECKS_OK"
+            echo "Extra changes applied: 2 (server runtime directory and agent SONAME)"
             echo "Patch status: see effective-patch-report.txt (direct original vs ported equivalents)."
             echo "Note: static checks do not prove successful runtime injection or every anti-detection behavior."
           } > dist/BUILD_PROVENANCE.txt
@@ -605,7 +799,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: florida-17.16.4-${{ inputs.arch }}
+          name: florida-17.16.4-${{ inputs.arch }}-extra2
           path: dist/*
           if-no-files-found: error
           retention-days: 30
@@ -614,12 +808,14 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: florida-diagnostics-${{ inputs.arch }}
+          name: florida-diagnostics-${{ inputs.arch }}-extra2
           path: |
             *-patches.txt
             patch-summary.txt
             effective-patch-report.txt
             agent-audit.json
+            extra-patches.json
+            server-hardening-audit.json
             PATCH_INPUT_SHA256SUMS.txt
             *-effective.patch
           if-no-files-found: warn
