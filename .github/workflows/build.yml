@@ -81,7 +81,7 @@ jobs:
           echo 'Frida tags at HEAD:'
           git -C frida tag --points-at HEAD
 
-      - name: Apply Florida patches
+      - name: Apply Florida patches (port RPC patch for Frida 17.16.4)
         shell: bash
         run: |
           set -euo pipefail
@@ -102,8 +102,71 @@ jobs:
               continue
             fi
             echo "Applying ${#patches[@]} patch(es) for $name"
-            ( cd "$target" && git am "${patches[@]}" )
-            applied=$((applied + ${#patches[@]}))
+            if [[ "$name" == 'frida-core' ]]; then
+              if [[ "${patches[0]##*/}" != *string_frida_rpc.patch ]]; then
+                echo 'ERROR: Unexpected first frida-core patch; refusing to guess.' >&2
+                exit 1
+              fi
+              # The original 2023 patch context differs from Frida 17.16.4.
+              # Port exactly its RPC string changes using stable source anchors.
+              python - <<'PYRPC'
+          from pathlib import Path
+          import re
+
+          p = Path('frida/subprojects/frida-core/lib/base/rpc.vala')
+          s = p.read_text(encoding='utf-8')
+          if 'getRpcStr(' in s:
+              raise SystemExit('RPC port already present: unexpected input')
+
+          constructor = re.compile(
+              r'(?m)^(?P<indent>[ \t]*)public RpcClient \(RpcPeer peer\) \{[ \t]*\n'
+              r'(?P=indent)[ \t]+Object \(peer: peer\);[ \t]*\n'
+              r'(?P=indent)\}',
+          )
+          m = constructor.search(s)
+          if m is None or len(constructor.findall(s)) != 1:
+              raise SystemExit('Expected RpcClient constructor not found exactly once')
+          indent = m.group('indent')
+          child = indent + '\t'
+          addition = '\n\n' + '\n'.join([
+              indent + 'public string getRpcStr(bool quote) {',
+              child + 'string result = (string) GLib.Base64.decode((string) GLib.Base64.decode("Wm5KcFpHRTZjbkJq"));',
+              child + 'if(quote) {',
+              child + '\treturn "\\\"" + result + "\\\"";',
+              child + '} else {',
+              child + '\treturn result;',
+              child + '}',
+              indent + '}',
+          ])
+          s = s[:m.end()] + addition + s[m.end():]
+
+          changes = [
+              ('.add_string_value ("frida:rpc")', '.add_string_value (getRpcStr(false))'),
+              ('if (json.index_of ("\\\"frida:rpc\\\"") == -1)',
+               'if (json.index_of (getRpcStr(true)) == -1)'),
+              ('if (type == null || type != "frida:rpc")',
+               'if (type == null || type != getRpcStr(false))'),
+          ]
+          for old, new in changes:
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f'Expected exactly one RPC anchor {old!r}, got {count}')
+              s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+          print('RPC_PATCH_PORTED=1')
+          PYRPC
+              git -C "$target" diff --check
+              git -C "$target" add lib/base/rpc.vala
+              git -C "$target" commit -m 'Port Florida string_frida_rpc to Frida 17.16.4'
+              applied=$((applied + 1))
+              if (( ${#patches[@]} > 1 )); then
+                ( cd "$target" && git am --3way "${patches[@]:1}" )
+                applied=$((applied + ${#patches[@]} - 1))
+              fi
+            else
+              ( cd "$target" && git am --3way "${patches[@]}" )
+              applied=$((applied + ${#patches[@]}))
+            fi
           done
           if (( applied == 0 )); then
             echo 'ERROR: No Florida patches were found/applied.' >&2
