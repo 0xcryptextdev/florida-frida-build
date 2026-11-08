@@ -466,6 +466,7 @@ jobs:
           import json
           import os
           from elftools.elf.elffile import ELFFile
+          from elftools.elf.hash import GNUHashTable, ELFHashTable
           build = Path('build-' + os.environ['TARGET_ARCH'])
           agentdir = build / 'subprojects/frida-core/src/frida-data-agent-blob.S.p'
           # From the pinned frida-core/compat/build.py native/emulated defaults.
@@ -488,8 +489,14 @@ jobs:
               elf = ELFFile(io.BytesIO(data))
               if (elf.elfclass, elf.header['e_machine']) != expected[flavor]:
                   raise SystemExit('::error::Wrong ELF architecture: ' + str(path))
-              dynsym = elf.get_section_by_name('.dynsym')
-              mains = [] if dynsym is None else dynsym.get_symbol_by_name('main') or []
+              # Android's loader follows PT_DYNAMIC, not section names. LIEF
+              # 0.13.2 can leave a stale .gnu.hash section after removing its
+              # DT_GNU_HASH tag and rebuilding the active DT_HASH table.
+              dynamic = next((s for s in elf.iter_segments()
+                              if s.header['p_type'] == 'PT_DYNAMIC'), None)
+              if dynamic is None:
+                  raise SystemExit('::error::Agent PT_DYNAMIC segment absent: ' + str(path))
+              mains = dynamic.get_symbol_by_name('main') or []
               exports = [s for s in mains if s.entry['st_shndx'] != 'SHN_UNDEF'
                          and s.entry['st_info']['bind'] in {'STB_GLOBAL', 'STB_WEAK'}
                          and s.entry['st_info']['type'] == 'STT_FUNC'
@@ -497,12 +504,29 @@ jobs:
                          and s.entry['st_value'] != 0]
               if not exports:
                   raise SystemExit('::error::Defined dynamic main function absent: ' + str(path))
-              # dlsym uses the ELF hash tables; a renamed .dynsym entry alone
-              # does not prove the loader can find it after an ELF rewrite.
-              hashes = [elf.get_section_by_name(n) for n in ('.gnu.hash', '.hash')]
-              hashes = [section for section in hashes if section is not None]
-              if not hashes or any(section.get_symbol('main') is None for section in hashes):
-                  raise SystemExit('::error::ELF hash lookup cannot find main: ' + str(path))
+              # Resolve every hash table advertised to the loader by its VA.
+              # An orphaned section without a dynamic tag is not a lookup path.
+              active_hashes = []
+              inactive_sections = []
+              for tag, section_name, table_class in (
+                  ('DT_GNU_HASH', '.gnu.hash', GNUHashTable),
+                  ('DT_HASH', '.hash', ELFHashTable),
+              ):
+                  address, offset = dynamic.get_table_offset(tag)
+                  if address is None:
+                      if elf.get_section_by_name(section_name) is not None:
+                          inactive_sections.append(section_name)
+                      continue
+                  if offset is None:
+                      raise SystemExit(f'::error::Unmapped {tag} address in {path}')
+                  table = table_class(elf, offset, dynamic)
+                  resolved = table.get_symbol('main')
+                  if resolved is None or not any(resolved.entry == s.entry for s in exports):
+                      raise SystemExit(f'::error::ELF hash lookup cannot find main via {tag}: {path}')
+                  active_hashes.append({'tag': tag, 'virtual_address': address,
+                                        'file_offset': offset, 'main_resolved': True})
+              if not active_hashes:
+                  raise SystemExit('::error::No loader-visible ELF hash table: ' + str(path))
               # The cumulative 0003/0004/0005/0007 patcher must replace these exact signatures.
               for signature in (b'frida_agent_main', b'gum-js-loop', b'gmain', b'gdbus'):
                   if signature in data:
@@ -518,7 +542,12 @@ jobs:
                               'sha256': hashlib.sha256(data).hexdigest(),
                               'elf_class': elf.elfclass, 'machine': elf.header['e_machine'],
                               'defined_dynamic_main': True, 'hash_lookup_main': True,
+                              'active_hash_tables': active_hashes,
+                              'inactive_hash_sections': inactive_sections,
                               'signature_audit': 'PASS'})
+              print('ELF_LOADER_HASH_OK: ' + str(path) + ' active=' +
+                    ','.join(h['tag'] for h in active_hashes) + ' inactive-sections=' +
+                    (','.join(inactive_sections) or 'none'))
               print('AGENT_PATCH_CHECK_OK: ' + str(path) + ' (' + str(len(data)) + ' bytes)')
           Path('agent-audit.json').write_text(json.dumps(records, indent=2) + '\n')
           server_path = build / 'subprojects/frida-core/server/frida-server'
