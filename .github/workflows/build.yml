@@ -1,4 +1,4 @@
-name: Florida Frida 17.16.4 - Source Port Audit Build
+name: Florida Frida 17.16.4 - No Skip Sequential Build
 
 on:
   workflow_dispatch:
@@ -97,7 +97,7 @@ jobs:
           test -f florida-helpers/scripts/anti-anti-frida.py
           echo "Carry helpers commit: $(git -C florida-helpers rev-parse HEAD)"
 
-      - name: Apply patches independently (no three-way merges)
+      - name: Apply all 11 patches with 17.16.4-specific ports (no skipping)
         shell: bash
         run: |
           set -euo pipefail
@@ -105,49 +105,135 @@ jobs:
           git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
           shopt -s nullglob
           total=0
-          applied=0
-          skipped=0
+          direct=0
+          ported=0
           : > skipped-patches.txt
+          : > ported-patches.txt
+          : > applied-patches.txt
           for patch_dir in "$GITHUB_WORKSPACE"/florida-patches/patches/*; do
             [[ -d "$patch_dir" ]] || continue
             subproject="${patch_dir##*/}"
             target="$GITHUB_WORKSPACE/frida/subprojects/$subproject"
-            if [[ ! -d "$target" ]]; then
-              echo "::error::Missing Frida subproject: $subproject"
-              exit 1
-            fi
-            patches=( "$patch_dir"/*.patch )
-            for patch in "${patches[@]}"; do
-              total=$((total + 1))
+            [[ -d "$target" ]] || { echo "::error::Missing subproject: $subproject"; exit 1; }
+            for patch in "$patch_dir"/*.patch; do
               label="$subproject/${patch##*/}"
+              total=$((total + 1))
               echo "::group::PATCH $label"
-              if ( cd "$target" && git am --ignore-whitespace "$patch" ); then
-                echo "APPLIED: $label"
-                applied=$((applied + 1))
-              else
-                git -C "$target" am --abort || true
-                echo "::warning::Original patch could not be applied; carry fixes will repair only known cases: $label"
-                echo "$label" >> skipped-patches.txt
-                skipped=$((skipped + 1))
-              fi
+              case "$label" in
+                frida-core/0001-Florida-string_frida_rpc.patch)
+                  # The 17.16.4 constructor has new doc comments. Port the entire
+                  # original 0001 edit with exact assertions, not a patch skip.
+                  TARGET="$target" python3 - <<'PY_RPC'
+          from pathlib import Path
+          import os
+          p = Path(os.environ['TARGET']) / 'lib/base/rpc.vala'
+          old = p.read_text()
+          anchor = '\t\t\tObject (peer: peer);\n\t\t}\n'
+          if old.count(anchor) != 1:
+              raise SystemExit('::error::0001 port: RPC constructor anchor changed')
+          if 'public string getRpcStr' in old:
+              raise SystemExit('::error::0001 port: RPC already edited unexpectedly')
+          method = (
+              '\t\tpublic string getRpcStr(bool quote){\n'
+              '\t\t\tstring result = (string) GLib.Base64.decode('
+              '(string) GLib.Base64.decode("Wm5KcFpHRTZjbkJq"));\n'
+              '\t\t\tif(quote){\n'
+              '\t\t\t\treturn "\\\"" + result + "\\\"";\n'
+              '\t\t\t}else{\n'
+              '\t\t\t\treturn result;\n'
+              '\t\t\t}\n'
+              '\t\t}\n'
+          )
+          new = old.replace(anchor, anchor + '\n' + method, 1)
+          replacements = [
+              ('.add_string_value ("frida:rpc")', '.add_string_value (getRpcStr(false))'),
+              (r'if (json.index_of ("\"frida:rpc\"") == -1)',
+               'if (json.index_of (getRpcStr(true)) == -1)'),
+              ('if (type == null || type != "frida:rpc")',
+               'if (type == null || type != getRpcStr(false))'),
+          ]
+          for before, after in replacements:
+              if new.count(before) != 1:
+                  raise SystemExit('::error::0001 port missing or duplicate original code: ' + before)
+              new = new.replace(before, after, 1)
+          p.write_text(new)
+          print('PORT_0001_ALL_3_RPC_CALL_SITES=OK')
+          PY_RPC
+                  git -C "$target" add lib/base/rpc.vala
+                  git -C "$target" diff --cached --check
+                  git -C "$target" commit -m 'Florida: string_frida_rpc (17.16.4 context port)'
+                  echo "$label" >> ported-patches.txt
+                  ported=$((ported + 1))
+                  ;;
+                frida-core/0003-Florida-symbol_frida_agent_main.patch)
+                  # Only the legacy Windows hunk conflicts. Apply the original
+                  # patch's new-file hunk, then port the entrypoint call sites
+                  # with exact assertions, including BOTH tests.
+                  git -C "$target" apply --check --include='src/anti-anti-frida.py' "$patch"
+                  git -C "$target" apply --include='src/anti-anti-frida.py' "$patch"
+                  TARGET="$target" python3 - <<'PY_ENTRY'
+          from pathlib import Path
+          import os
+          root = Path(os.environ['TARGET'])
+          paths = [
+              'src/agent-container.vala',
+              'src/linux/linux-host-session.vala',
+              'src/darwin/darwin-host-session.vala',
+              'src/freebsd/freebsd-host-session.vala',
+              'src/qnx/qnx-host-session.vala',
+              'src/windows/windows-host-session.vala',
+              'tests/test-agent.vala',
+              'tests/test-injector.vala',
+          ]
+          for rel in paths:
+              p = root / rel
+              if not p.is_file():
+                  raise SystemExit('::error::0003 missing source file: ' + rel)
+              src = p.read_text()
+              needle = '"frida_agent_main"'
+              if src.count(needle) != 1:
+                  raise SystemExit('::error::0003 expected exactly one entrypoint: ' + rel)
+              p.write_text(src.replace(needle, '"main"', 1))
+              print('PORT_0003_FILE_OK=' + rel)
+          if not (root / 'src/anti-anti-frida.py').is_file():
+              raise SystemExit('::error::0003 original script was not added')
+          PY_ENTRY
+                  git -C "$target" add -A
+                  git -C "$target" diff --cached --check
+                  git -C "$target" commit -m 'Florida: symbol_frida_agent_main (17.16.4 context port)'
+                  echo "$label" >> ported-patches.txt
+                  ported=$((ported + 1))
+                  ;;
+                *)
+                  # Remaining patches, INCLUDING original 0004/0005/0007,
+                  # MUST apply cleanly; any failure stops the workflow.
+                  git -C "$target" am --ignore-whitespace "$patch"
+                  echo "$label" >> applied-patches.txt
+                  direct=$((direct + 1))
+                  ;;
+              esac
+              echo "PATCH_OK: $label"
               echo '::endgroup::'
             done
           done
-          if (( total == 0 )); then
-            echo '::error::No Florida patches found'
+          if (( total != 11 || direct != 9 || ported != 2 )); then
+            echo "::error::Unexpected coverage: total=$total direct=$direct ported=$ported"
             exit 1
           fi
-          printf 'PATCHES_TOTAL=%d\nPATCHES_APPLIED_DIRECTLY=%d\nPATCHES_SKIPPED=%d\n' \
-            "$total" "$applied" "$skipped" | tee patch-summary.txt
-          if (( skipped > 0 )); then
-            echo 'Original patches not directly applied:'
-            cat skipped-patches.txt
-          fi
+          [[ ! -s skipped-patches.txt ]] || { echo '::error::Unexpected skips'; exit 1; }
+          printf 'PATCHES_TOTAL=%d\nPATCHES_APPLIED_DIRECTLY=%d\nPATCHES_PORTED_FOR_17_16_4=%d\nPATCHES_SKIPPED=0\n' \
+            "$total" "$direct" "$ported" | tee patch-summary.txt
+          echo 'ALL_11_PATCHES_ACCOUNTED_FOR_NO_SKIPS'
 
       - name: Apply Florida carry fixes and source validation
         shell: bash
         run: |
           set -euo pipefail
+          # All original patches are now applied/ported in order.
+          # Replace the legacy ELF rewrite script with the previously audited
+          # compatibility version AFTER 0004, 0005, and 0007 git-am commits.
+          cp "$GITHUB_WORKSPACE/florida-helpers/scripts/anti-anti-frida.py" \
+            frida/subprojects/frida-core/src/anti-anti-frida.py
           cd frida
           python3 "$GITHUB_WORKSPACE/florida-helpers/scripts/florida_carry.py"
           git -C subprojects/frida-core diff --check
@@ -165,6 +251,7 @@ jobs:
           script = core / 'anti-anti-frida.py'
           helper = Path('florida-helpers/scripts/anti-anti-frida.py')
           skipped = set(Path('skipped-patches.txt').read_text().splitlines())
+          ported = set(Path('ported-patches.txt').read_text().splitlines())
           expected = {
               'frida-core/0001-Florida-string_frida_rpc.patch',
               'frida-core/0003-Florida-symbol_frida_agent_main.patch',
@@ -178,7 +265,12 @@ jobs:
                   raise SystemExit('::error::SOURCE PATCH AUDIT FAILED: ' + detail)
 
           # Reject ANY unreviewed skipped patches instead of building a partial Florida server.
-          require(not (skipped - expected), 'unexpected skipped patches: ' + str(sorted(skipped - expected)))
+          require(not skipped, 'any skipped patch is forbidden: ' + str(sorted(skipped)))
+          require(ported == {
+              'frida-core/0001-Florida-string_frida_rpc.patch',
+              'frida-core/0003-Florida-symbol_frida_agent_main.patch',
+          }, 'unexpected 17.16.4 port set: ' + str(sorted(ported)))
+          require(len(Path('applied-patches.txt').read_text().splitlines()) == 9, 'nine original git-am patches required')
           require(len(list(Path('florida-patches/patches').glob('*/*.patch'))) == 11,
                   'expected exactly 11 Florida patch files for this source tag')
           for rel in expected:
@@ -247,12 +339,13 @@ jobs:
           lines = [
               'FRIDA_VERSION=17.16.4',
               'EXPECTED_FLORIDA_PATCHES=11',
-              'APPLIED_ORIGINAL_GIT_PATCHES=' + str(11 - len(skipped)),
-              'PORTED_EQUIVALENT_SOURCE_PATCHES=' + str(len(skipped)),
+              'APPLIED_ORIGINAL_GIT_PATCHES=9',
+              'PORTED_FOR_17_16_4=2',
+              'SKIPPED_PATCHES=0',
               'SOURCE_AUDIT=PASS',
               'NOTE=This verifies source-level equivalents; agent binaries and runtime still require verification.',
           ]
-          lines += ['PORT_SOURCE ' + k for k in sorted(skipped)]
+          lines += ['PORT_SOURCE ' + k for k in sorted(ported)]
           Path('effective-patch-report.txt').write_text('\n'.join(lines) + '\n')
           print('\n'.join(lines))
           print('FLORIDA_SOURCE_PATCH_COVERAGE=11/11')
@@ -323,7 +416,7 @@ jobs:
           out="dist/florida-server-$FRIDA_VERSION-$TARGET_ARCH"
           cp "$src" "$out"
           gzip -9 -c "$out" > "$out.gz"
-          cp patch-summary.txt skipped-patches.txt effective-patch-report.txt dist/
+          cp patch-summary.txt skipped-patches.txt ported-patches.txt applied-patches.txt effective-patch-report.txt dist/
           {
             echo "Frida version: $FRIDA_VERSION"
             echo "Florida revision: $(git -C florida-patches rev-parse HEAD)"
