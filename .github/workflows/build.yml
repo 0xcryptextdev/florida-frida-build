@@ -1,13 +1,13 @@
-name: Build Florida 17.16.4 (manual)
+name: Florida 17.16.4 - Android Server Build
 
 on:
   workflow_dispatch:
     inputs:
       arch:
-        description: Android target architecture
+        description: 'Android architecture'
         required: true
-        type: choice
         default: android-arm64
+        type: choice
         options:
           - android-arm64
           - android-arm
@@ -68,7 +68,7 @@ jobs:
             python3-dev python3-pip pkg-config
           python -m pip install lief graphlib
 
-      - name: Clone Florida and Frida at 17.16.4
+      - name: Clone Florida and Frida 17.16.4
         shell: bash
         run: |
           set -euo pipefail
@@ -76,21 +76,75 @@ jobs:
             https://github.com/Ylarod/Florida.git florida-patches
           git clone --depth 1 --shallow-submodules --recurse-submodules \
             --branch "$FRIDA_VERSION" https://github.com/frida/frida.git frida
-          echo 'Florida commit:'
-          git -C florida-patches rev-parse HEAD
-          echo 'Frida commit:'
-          git -C frida rev-parse HEAD
-          echo 'Florida tags at HEAD:'
-          git -C florida-patches tag --points-at HEAD
+          echo "Florida commit: $(git -C florida-patches rev-parse HEAD)"
+          echo "Frida commit: $(git -C frida rev-parse HEAD)"
           echo 'Frida tags at HEAD:'
           git -C frida tag --points-at HEAD
 
-      - name: Apply Florida patch series
+      - name: Apply Florida patches
         shell: bash
         run: |
           set -euo pipefail
           git config --global user.name 'GitHub Actions'
           git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          find "$GITHUB_WORKSPACE/florida-patches/patches" -type f -name '*.patch' -print > patch-list.txt
-          test -s patch-list.txt
-          cat patch-list.txt
+          shopt -s nullglob
+          applied=0
+          for patch_dir in "$GITHUB_WORKSPACE"/florida-patches/patches/*; do
+            [[ -d "$patch_dir" ]] || continue
+            name="${patch_dir##*/}"
+            target="$GITHUB_WORKSPACE/frida/subprojects/$name"
+            if [[ ! -d "$target" ]]; then
+              echo "ERROR: missing subproject: $target" >&2
+              exit 1
+            fi
+            patches=( "$patch_dir"/*.patch )
+            if (( ${#patches[@]} == 0 )); then
+              continue
+            fi
+            echo "Applying ${#patches[@]} patch(es) for $name"
+            ( cd "$target" && git am "${patches[@]}" )
+            applied=$((applied + ${#patches[@]}))
+          done
+          if (( applied == 0 )); then
+            echo 'ERROR: No Florida patches were found/applied.' >&2
+            exit 1
+          fi
+          echo "PATCHES_APPLIED=$applied"
+
+      - name: Compile frida-server
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_ROOT='${{ steps.ndk.outputs.ndk-path }}'
+          test -d "$ANDROID_NDK_ROOT"
+          mkdir -p "build-$TARGET_ARCH"
+          cd "build-$TARGET_ARCH"
+          ../frida/configure --host="$TARGET_ARCH"
+          make -j2
+          test -s subprojects/frida-core/server/frida-server
+          echo 'FRIDA_SERVER_BUILD_SUCCESS'
+
+      - name: Package binary and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          server="build-$TARGET_ARCH/subprojects/frida-core/server/frida-server"
+          test -s "$server"
+          mkdir -p dist
+          out="dist/florida-server-$FRIDA_VERSION-$TARGET_ARCH"
+          cp "$server" "$out"
+          gzip -9 -c "$out" > "$out.gz"
+          (
+            cd dist
+            sha256sum "$(basename "$out")" "$(basename "$out").gz" > SHA256SUMS.txt
+          )
+          file "$out"
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: florida-17.16.4-${{ inputs.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
