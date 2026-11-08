@@ -1,4 +1,4 @@
-name: Florida Frida 17.16.4 - No Skip Sequential Build
+name: Florida Frida 17.16.4 - Verified 11 Patch Build
 
 on:
   workflow_dispatch:
@@ -33,18 +33,18 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc || true
           df -h .
 
-      - name: Set up Python 3.9
-        uses: actions/setup-python@v5
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7.1.0
         with:
-          python-version: '3.9'
+          python-version: '3.11'
 
-      - name: Set up Node.js 18
-        uses: actions/setup-node@v4
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7.1.0
         with:
-          node-version: '18'
+          node-version: '24'
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6.2.0
         with:
           distribution: temurin
           java-version: '17'
@@ -66,7 +66,8 @@ jobs:
             build-essential ninja-build flex bison \
             gcc-multilib g++-multilib libc6-dev-i386 \
             python3-dev python3-pip pkg-config
-          python -m pip install 'lief==0.13.2' graphlib
+          # graphlib is part of the Python standard library (3.9+).
+          python -m pip install 'lief==0.13.2' 'pyelftools==0.32'
 
       - name: Clone Frida and Florida at 17.16.4
         shell: bash
@@ -79,6 +80,12 @@ jobs:
           echo "Florida: $(git -C florida-patches rev-parse HEAD)"
           echo "Frida:   $(git -C frida rev-parse HEAD)"
           git -C frida tag --points-at HEAD | grep -Fx "$FRIDA_VERSION"
+          # A tag existing in both repositories does not imply patch compatibility.
+          # These are the exact snapshots audited for the two ports below.
+          test "$(git -C florida-patches rev-parse HEAD)" = 6d4b2e88ebe2bace12322db93470b0e68d4240c9
+          test "$(git -C frida rev-parse HEAD)" = c9867320e284f790f0db8a327c2e4035eb790fe4
+          test "$(git -C frida/subprojects/frida-core rev-parse HEAD)" = 0e1a53ba7ab7615e6c8cc0cf1ee4fc45ab7d0722
+          test "$(git -C frida/subprojects/frida-gum rev-parse HEAD)" = 7eddbb15847ac18c15d21ae1cff48103acd944d5
 
       - name: Fetch reviewed third-party carry fixes
         shell: bash
@@ -101,8 +108,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config --global user.name 'GitHub Actions'
-          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
           shopt -s nullglob
           total=0
           direct=0
@@ -115,6 +120,8 @@ jobs:
             subproject="${patch_dir##*/}"
             target="$GITHUB_WORKSPACE/frida/subprojects/$subproject"
             [[ -d "$target" ]] || { echo "::error::Missing subproject: $subproject"; exit 1; }
+            git -C "$target" config user.name 'GitHub Actions'
+            git -C "$target" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             for patch in "$patch_dir"/*.patch; do
               label="$subproject/${patch##*/}"
               total=$((total + 1))
@@ -175,31 +182,36 @@ jobs:
           from pathlib import Path
           import os
           root = Path(os.environ['TARGET'])
-          paths = [
-              'src/agent-container.vala',
-              'src/linux/linux-host-session.vala',
-              'src/darwin/darwin-host-session.vala',
-              'src/freebsd/freebsd-host-session.vala',
-              'src/qnx/qnx-host-session.vala',
-              'src/windows/windows-host-session.vala',
-              'tests/test-agent.vala',
-              'tests/test-injector.vala',
-          ]
-          for rel in paths:
+          # Windows has both HAVE_EMBEDDED_ASSETS and installed-library branches.
+          # Keep exact per-file counts, and migrate BOTH Windows entrypoints.
+          paths = {
+              'src/agent-container.vala': 1,
+              'src/linux/linux-host-session.vala': 1,
+              'src/darwin/darwin-host-session.vala': 1,
+              'src/freebsd/freebsd-host-session.vala': 1,
+              'src/qnx/qnx-host-session.vala': 1,
+              'src/windows/windows-host-session.vala': 2,
+              'tests/test-agent.vala': 1,
+              'tests/test-injector.vala': 1,
+          }
+          for rel, expected_count in paths.items():
               p = root / rel
               if not p.is_file():
                   raise SystemExit('::error::0003 missing source file: ' + rel)
               src = p.read_text()
               needle = '"frida_agent_main"'
-              if src.count(needle) != 1:
-                  raise SystemExit('::error::0003 expected exactly one entrypoint: ' + rel)
-              p.write_text(src.replace(needle, '"main"', 1))
+              if src.count(needle) != expected_count:
+                  raise SystemExit(f'::error::0003 expected {expected_count} entrypoints: {rel}')
+              p.write_text(src.replace(needle, '"main"'))
               print('PORT_0003_FILE_OK=' + rel)
           if not (root / 'src/anti-anti-frida.py').is_file():
               raise SystemExit('::error::0003 original script was not added')
           PY_ENTRY
                   git -C "$target" add -A
-                  git -C "$target" diff --cached --check
+                  # Preserve the historical script byte-for-byte here: 0004,
+                  # 0005 and 0007 depend on it, including its missing final LF.
+                  # Audit whitespace in the final compatibility script below.
+                  git -C "$target" diff --cached --check -- . ':!src/anti-anti-frida.py'
                   git -C "$target" commit -m 'Florida: symbol_frida_agent_main (17.16.4 context port)'
                   echo "$label" >> ported-patches.txt
                   ported=$((ported + 1))
@@ -236,7 +248,35 @@ jobs:
             frida/subprojects/frida-core/src/anti-anti-frida.py
           cd frida
           python3 "$GITHUB_WORKSPACE/florida-helpers/scripts/florida_carry.py"
+          python3 - <<'PY_EMBED'
+          from pathlib import Path
+          import re
+          p = Path('subprojects/frida-core/src/embed-agent.py')
+          src = p.read_text()
+          # Replace the pinned helper's shell command with checked argv handling.
+          # Absent architectures have empty placeholder files, not ELF agents.
+          replacement = '''            # FLORIDA_AGENT_PATCH_HOOK_BEGIN
+                      if agent is not None:
+                          import os
+                          patcher = Path(os.environ.get(
+                              "FLORIDA_ANTI_ANTI_FRIDA",
+                              str(Path(__file__).with_name("anti-anti-frida.py")))).resolve()
+                          if not embedded_agent.is_file() or embedded_agent.stat().st_size == 0:
+                              raise RuntimeError(f"Missing agent payload: {embedded_agent}")
+                          subprocess.run([sys.executable, str(patcher), str(embedded_agent)], check=True)
+                      # FLORIDA_AGENT_PATCH_HOOK_END
+          '''
+          pattern = (r' {12}# --- florida-zygisk carry: robust anti-anti-frida invocation ---\n'
+                     r'.*? {12}# --- end carry ---\n')
+          updated, count = re.subn(pattern, lambda _: replacement, src, flags=re.S)
+          if count != 1:
+              raise SystemExit('::error::Expected exactly one pinned embed hook')
+          compile(updated, str(p), 'exec')
+          p.write_text(updated)
+          print('EMBED_HOOK_CHECKED_ARGV=OK')
+          PY_EMBED
           git -C subprojects/frida-core diff --check
+          git -C subprojects/frida-gum diff --check
           echo 'CARRY_FIXES_COMPLETE'
 
       - name: Strictly audit all 11 Florida patch effects (fail closed)
@@ -252,6 +292,20 @@ jobs:
           helper = Path('florida-helpers/scripts/anti-anti-frida.py')
           skipped = set(Path('skipped-patches.txt').read_text().splitlines())
           ported = set(Path('ported-patches.txt').read_text().splitlines())
+          applied = Path('applied-patches.txt').read_text().splitlines()
+          expected_all = {
+              'frida-core/0001-Florida-string_frida_rpc.patch',
+              'frida-core/0002-Florida-frida_agent_so.patch',
+              'frida-core/0003-Florida-symbol_frida_agent_main.patch',
+              'frida-core/0004-Florida-thread_gum_js_loop.patch',
+              'frida-core/0005-Florida-thread_gmain.patch',
+              'frida-core/0006-Florida-protocol_unexpected_command.patch',
+              'frida-core/0007-Florida-update-python-script.patch',
+              'frida-core/0008-Florida-pool-frida.patch',
+              'frida-core/0009-Florida-memfd-name-jit-cache.patch',
+              'frida-core/0010-exec-anti-anti-frida.py.patch',
+              'frida-gum/0001-Florida-pool-frida.patch',
+          }
           expected = {
               'frida-core/0001-Florida-string_frida_rpc.patch',
               'frida-core/0003-Florida-symbol_frida_agent_main.patch',
@@ -270,9 +324,11 @@ jobs:
               'frida-core/0001-Florida-string_frida_rpc.patch',
               'frida-core/0003-Florida-symbol_frida_agent_main.patch',
           }, 'unexpected 17.16.4 port set: ' + str(sorted(ported)))
-          require(len(Path('applied-patches.txt').read_text().splitlines()) == 9, 'nine original git-am patches required')
-          require(len(list(Path('florida-patches/patches').glob('*/*.patch'))) == 11,
-                  'expected exactly 11 Florida patch files for this source tag')
+          require(len(applied) == 9 and set(applied) == expected_all - ported,
+                  'the exact nine original git-am patches are required')
+          actual_all = {str(p.relative_to('florida-patches/patches'))
+                        for p in Path('florida-patches/patches').glob('*/*.patch')}
+          require(actual_all == expected_all, 'unexpected Florida patch manifest')
           for rel in expected:
               require((Path('florida-patches/patches') / rel).exists(), 'missing original patch: ' + rel)
 
@@ -280,10 +336,9 @@ jobs:
           rpc = (root / 'lib/base/rpc.vala').read_text()
           require('public string getRpcStr' in rpc, '0001 RPC helper absent')
           require('Wm5KcFpHRTZjbkJq' in rpc, '0001 RPC encoding absent')
-          require('getRpcStr(false)' in rpc and 'getRpcStr(true)' in rpc,
-                  '0001 RPC call-sites not both migrated')
-          require('.add_string_value ("frida:rpc")' not in rpc,
-                  '0001 original RPC wire string still used at call-site')
+          require(rpc.count('getRpcStr(false)') == 2 and rpc.count('getRpcStr(true)') == 1,
+                  '0001 all three RPC call sites must be migrated')
+          require('frida:rpc' not in rpc, '0001 original RPC wire literal remains')
 
           # 0003: target-specific entrypoints and original test-call sites.
           for rel in (
@@ -301,18 +356,13 @@ jobs:
                       '0003 old literal entrypoint in ' + rel)
               require('"main"' in txt, '0003 new literal entrypoint not found in ' + rel)
 
-          # The carry helper handles runtime source but not Florida's test-only hunks:
-          # forward-port those test call sites for full source-equivalent coverage.
+          # Auditing is read-only: the application step must already fix the tests.
           for rel in ('test-agent.vala', 'test-injector.vala'):
               f = root / 'tests' / rel
               require(f.exists(), '0003 missing expected test source: ' + str(f))
-              previous = f.read_text()
-              updated = previous.replace('"frida_agent_main"', '"main"')
-              if updated != previous:
-                  f.write_text(updated)
-                  print('PORT_TEST_CALL_SITE=' + str(f))
               require('"frida_agent_main"' not in f.read_text(),
                       '0003 original test entrypoint remains: ' + rel)
+              require('"main"' in f.read_text(), '0003 new test entrypoint absent: ' + rel)
 
           # 0003+0004+0005+0007: the helper provides the final cumulative script.
           require(script.is_file(), '0003 final anti-anti-frida.py absent')
@@ -332,8 +382,44 @@ jobs:
           ):
               require(marker in s, patch + ' marker absent')
           embed = (core / 'embed-agent.py').read_text()
-          require('FLORIDA_ANTI_ANTI_FRIDA' in embed and 'anti-anti-frida' in embed,
-                  '0003-0007 processing is not hooked into agent embedding')
+          require('FLORIDA_AGENT_PATCH_HOOK_BEGIN' in embed and
+                  'subprocess.run([sys.executable, str(patcher), str(embedded_agent)], check=True)' in embed,
+                  '0010 agent embedding must use the checked patch hook')
+          require('if agent is not None:' in embed and 'os.system(' not in embed,
+                  '0010 missing-agent placeholders or shell invocation are not handled')
+
+          # Independently verify every remaining direct patch against final source.
+          # Reversing these unaffected hunks must be possible; a counter alone
+          # cannot prove that the intended changes survive the carry stage.
+          import subprocess
+          for label in (
+              'frida-core/0002-Florida-frida_agent_so.patch',
+              'frida-core/0006-Florida-protocol_unexpected_command.patch',
+              'frida-core/0008-Florida-pool-frida.patch',
+              'frida-core/0009-Florida-memfd-name-jit-cache.patch',
+              'frida-gum/0001-Florida-pool-frida.patch',
+          ):
+              subproject = label.split('/')[0]
+              patch = (Path('florida-patches/patches') / label).resolve()
+              subprocess.run(['git', '-C', 'frida/subprojects/' + subproject,
+                              'apply', '--reverse', '--check', str(patch)], check=True)
+              print('FINAL_SOURCE_HUNK_OK=' + label)
+
+          # Save original patch hashes and final source deltas for later review.
+          import hashlib
+          manifest = []
+          for label in sorted(expected_all):
+              digest = hashlib.sha256((Path('florida-patches/patches') / label).read_bytes()).hexdigest()
+              manifest.append(digest + '  ' + label)
+          Path('PATCH_INPUT_SHA256SUMS.txt').write_text('\n'.join(manifest) + '\n')
+          for subproject, base in (
+              ('frida-core', '0e1a53ba7ab7615e6c8cc0cf1ee4fc45ab7d0722'),
+              ('frida-gum', '7eddbb15847ac18c15d21ae1cff48103acd944d5'),
+          ):
+              repo = 'frida/subprojects/' + subproject
+              subprocess.run(['git', '-C', repo, 'diff', '--check', base], check=True)
+              delta = subprocess.check_output(['git', '-C', repo, 'diff', '--binary', base])
+              Path(subproject + '-effective.patch').write_bytes(delta)
 
           # Account for all 11 Florida patches without mislabeling their Git histories.
           lines = [
@@ -369,29 +455,77 @@ jobs:
           test -s subprojects/frida-core/server/frida-server
           echo 'FRIDA_SERVER_BUILD_SUCCESS'
 
-      - name: Verify both embedded agent ELF files contain carried changes
+      - name: Verify all embedded agent ELFs and defined dynamic entrypoints
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY_AGENT'
           from pathlib import Path
+          import hashlib
+          import io
+          import json
           import os
+          from elftools.elf.elffile import ELFFile
           build = Path('build-' + os.environ['TARGET_ARCH'])
           agentdir = build / 'subprojects/frida-core/src/frida-data-agent-blob.S.p'
-          # The previous arm64 Actions log confirms these are the two real ELF agents.
-          agents = [agentdir / 'frida-agent-64.so', agentdir / 'frida-agent-32.so']
-          for path in agents:
-              if not path.is_file():
-                  raise SystemExit('::error::AGENT AUDIT FAILED: not found: ' + str(path))
+          # From the pinned frida-core/compat/build.py native/emulated defaults.
+          expected = {
+              'android-arm64': {'64': (64, 'EM_AARCH64'), '32': (32, 'EM_ARM')},
+              'android-arm': {'32': (32, 'EM_ARM')},
+              'android-x86_64': {'64': (64, 'EM_X86_64'), '32': (32, 'EM_386'),
+                                'arm64': (64, 'EM_AARCH64'), 'arm': (32, 'EM_ARM')},
+              'android-x86': {'32': (32, 'EM_386'), 'arm': (32, 'EM_ARM')},
+          }[os.environ['TARGET_ARCH']]
+          actual = {p.name.removeprefix('frida-agent-').removesuffix('.so'): p
+                    for p in agentdir.glob('frida-agent-*.so') if p.stat().st_size > 0}
+          if set(actual) != set(expected):
+              raise SystemExit(f'::error::AGENT AUDIT FAILED: expected {sorted(expected)}, got {sorted(actual)}')
+          records = []
+          for flavor, path in sorted(actual.items()):
               data = path.read_bytes()
               if not data.startswith(b'\x7fELF'):
                   raise SystemExit('::error::AGENT AUDIT FAILED: not ELF: ' + str(path))
+              elf = ELFFile(io.BytesIO(data))
+              if (elf.elfclass, elf.header['e_machine']) != expected[flavor]:
+                  raise SystemExit('::error::Wrong ELF architecture: ' + str(path))
+              dynsym = elf.get_section_by_name('.dynsym')
+              mains = [] if dynsym is None else dynsym.get_symbol_by_name('main') or []
+              exports = [s for s in mains if s.entry['st_shndx'] != 'SHN_UNDEF'
+                         and s.entry['st_info']['bind'] in {'STB_GLOBAL', 'STB_WEAK'}
+                         and s.entry['st_info']['type'] == 'STT_FUNC'
+                         and s.entry['st_other']['visibility'] in {'STV_DEFAULT', 'STV_PROTECTED'}
+                         and s.entry['st_value'] != 0]
+              if not exports:
+                  raise SystemExit('::error::Defined dynamic main function absent: ' + str(path))
+              # dlsym uses the ELF hash tables; a renamed .dynsym entry alone
+              # does not prove the loader can find it after an ELF rewrite.
+              hashes = [elf.get_section_by_name(n) for n in ('.gnu.hash', '.hash')]
+              hashes = [section for section in hashes if section is not None]
+              if not hashes or any(section.get_symbol('main') is None for section in hashes):
+                  raise SystemExit('::error::ELF hash lookup cannot find main: ' + str(path))
               # The cumulative 0003/0004/0005/0007 patcher must replace these exact signatures.
               for signature in (b'frida_agent_main', b'gum-js-loop', b'gmain', b'gdbus'):
                   if signature in data:
                       raise SystemExit('::error::AGENT AUDIT FAILED: ' + repr(signature)
                                        + ' still present in ' + str(path))
+              rodata = elf.get_section_by_name('.rodata')
+              if rodata is None:
+                  raise SystemExit('::error::Missing agent .rodata: ' + str(path))
+              for signature in (b'FridaScriptEngine', b'GLib-GIO', b'GDBusProxy', b'GumScript'):
+                  if signature in rodata.data():
+                      raise SystemExit('::error::Unpatched .rodata signature: ' + repr(signature))
+              records.append({'file': str(path), 'flavor': flavor, 'bytes': len(data),
+                              'sha256': hashlib.sha256(data).hexdigest(),
+                              'elf_class': elf.elfclass, 'machine': elf.header['e_machine'],
+                              'defined_dynamic_main': True, 'hash_lookup_main': True,
+                              'signature_audit': 'PASS'})
               print('AGENT_PATCH_CHECK_OK: ' + str(path) + ' (' + str(len(data)) + ' bytes)')
+          Path('agent-audit.json').write_text(json.dumps(records, indent=2) + '\n')
+          server_path = build / 'subprojects/frida-core/server/frida-server'
+          server = ELFFile(io.BytesIO(server_path.read_bytes()))
+          primary = '64' if os.environ['TARGET_ARCH'].endswith('64') else '32'
+          if (server.elfclass, server.header['e_machine']) != expected[primary]:
+              raise SystemExit('::error::Server ELF architecture does not match selected target')
           report = Path('effective-patch-report.txt')
           report.write_text(report.read_text() + 'AGENT_STATIC_AUDIT=PASS\n')
           print('FLORIDA_AGENT_PATCH_AUDIT_OK')
@@ -417,24 +551,47 @@ jobs:
           cp "$src" "$out"
           gzip -9 -c "$out" > "$out.gz"
           cp patch-summary.txt skipped-patches.txt ported-patches.txt applied-patches.txt effective-patch-report.txt dist/
+          cp agent-audit.json PATCH_INPUT_SHA256SUMS.txt frida-core-effective.patch frida-gum-effective.patch dist/
           {
             echo "Frida version: $FRIDA_VERSION"
             echo "Florida revision: $(git -C florida-patches rev-parse HEAD)"
             echo "Frida revision: $(git -C frida rev-parse HEAD)"
+            echo "Frida core revision: 0e1a53ba7ab7615e6c8cc0cf1ee4fc45ab7d0722"
+            echo "Frida gum revision: 7eddbb15847ac18c15d21ae1cff48103acd944d5"
             echo "Carry revision: $(git -C florida-helpers rev-parse HEAD)"
+            echo "Workflow revision: $GITHUB_SHA"
+            echo "Workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            python --version
+            node --version
             echo "Binary checks: BINARY_CHECKS_OK"
             echo "Patch status: see effective-patch-report.txt (direct original vs ported equivalents)."
             echo "Note: static checks do not prove successful runtime injection or every anti-detection behavior."
           } > dist/BUILD_PROVENANCE.txt
-          ( cd dist && sha256sum "$(basename "$out")" "$(basename "$out").gz" > SHA256SUMS.txt )
+          ( cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\0' |
+            sort -z | xargs -0 sha256sum > SHA256SUMS.txt )
           file "$out"
           cat dist/patch-summary.txt
           cat dist/SHA256SUMS.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: florida-17.16.4-${{ inputs.arch }}
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload diagnostic reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: florida-diagnostics-${{ inputs.arch }}
+          path: |
+            *-patches.txt
+            patch-summary.txt
+            effective-patch-report.txt
+            agent-audit.json
+            PATCH_INPUT_SHA256SUMS.txt
+            *-effective.patch
+          if-no-files-found: warn
+          retention-days: 14
